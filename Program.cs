@@ -16,6 +16,13 @@
 // WS_EX_TRANSPARENT, so any click on another window steals focus and
 // WM_KEYDOWN stops reaching us; a low-level hook keeps working
 // regardless of which window has focus.
+//
+// Z-order: TopMost = true alone marks us as topmost, but a freshly
+// created topmost window (start menu, Action Center, task view, toast
+// notifications, etc.) lands above us in the topmost z-band. We
+// re-pin to HWND_TOPMOST every 100ms so system-level popups never
+// break through the dark. SWP_NOACTIVATE keeps the user's focus where
+// it is — we only win the z-order, not the foreground.
 
 using System;
 using System.ComponentModel;
@@ -57,6 +64,12 @@ internal sealed class LumosForm : Form
     private const uint  VK_SUBTRACT     = 0x6D;   // numpad -
     private const uint  VK_OEM_PLUS     = 0xBB;   // main-row +/=
     private const uint  VK_OEM_MINUS    = 0xBD;   // main-row -/_
+
+    // ---------- Window z-order (topmost pinning) ----------
+    private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+    private const uint SWP_NOMOVE     = 0x0002;
+    private const uint SWP_NOSIZE     = 0x0001;
+    private const uint SWP_NOACTIVATE = 0x0010;
 
     // ---------- Lumos params ----------
     private const int MinRadius   = 50;
@@ -115,6 +128,12 @@ internal sealed class LumosForm : Form
 
     [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
     private static extern IntPtr GetModuleHandle(string lpModuleName);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetWindowPos(
+        IntPtr hWnd, IntPtr hWndInsertAfter,
+        int X, int Y, int cx, int cy, uint uFlags);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct POINT { public int X, Y; }
@@ -286,6 +305,22 @@ internal sealed class LumosForm : Form
         };
         timer.Start();
         Render();
+
+        // Pin to the very top of the topmost band. TopMost = true alone
+        // marks us as topmost, but a freshly created topmost window
+        // (start menu, Action Center, task view, toast notifications,
+        // etc.) lands above us in the topmost z-band. Re-pin every
+        // 100ms so system-level popups never break through the dark.
+        // SWP_NOACTIVATE keeps the user's focus where it is — we only
+        // win the z-order, not the foreground.
+        SetWindowPos(Handle, HWND_TOPMOST, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+
+        var pinTimer = new Timer { Interval = 100 };
+        pinTimer.Tick += (_, _) => SetWindowPos(
+            Handle, HWND_TOPMOST, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        pinTimer.Start();
     }
 
     private IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
