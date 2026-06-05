@@ -1,0 +1,36 @@
+## Build results
+bin/
+obj/
+out/
+*.dll
+*.exe
+*.pdb
+*.user
+*.suo
+
+## Distribution artifact (published separately via GitHub Releases)
+Lumos.exe
+
+## NuGet
+*.nupkg
+*.snupkg
+.nuget/
+packages/
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+## Visual Studio / Rider / VS Code
+.vs/
+.idea/
+.vscode/
+*.userosscache
+*.sln.docstates
+
+## Misc
+*.log
+*.tmp
+*.bak
+*.swp
+.DS_Store
+Thumbs.db
