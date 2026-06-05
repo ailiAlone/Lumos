@@ -10,8 +10,15 @@
 // transparent (alpha=0) so the actual desktop shows through; outside
 // is fully opaque black (alpha=255). A smoothstep falloff band gives
 // the halo a soft edge.
+//
+// Hotkeys (ESC / + / -) are handled by a low-level keyboard hook
+// (WH_KEYBOARD_LL) rather than the form's KeyDown event. The form is
+// WS_EX_TRANSPARENT, so any click on another window steals focus and
+// WM_KEYDOWN stops reaching us; a low-level hook keeps working
+// regardless of which window has focus.
 
 using System;
+using System.ComponentModel;
 using System.Drawing;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
@@ -39,6 +46,17 @@ internal sealed class LumosForm : Form
     private const uint ULW_ALPHA         = 0x00000002;
     private const byte AC_SRC_OVER       = 0x00;
     private const byte AC_SRC_ALPHA      = 0x01;
+
+    // ---------- Low-level keyboard hook ----------
+    private const int   WH_KEYBOARD_LL  = 13;
+    private const int   HC_ACTION       = 0;
+    private const int   WM_KEYDOWN      = 0x0100;
+    private const int   WM_SYSKEYDOWN   = 0x0104;
+    private const uint  VK_ESCAPE       = 0x1B;
+    private const uint  VK_ADD          = 0x6B;   // numpad +
+    private const uint  VK_SUBTRACT     = 0x6D;   // numpad -
+    private const uint  VK_OEM_PLUS     = 0xBB;   // main-row +/=
+    private const uint  VK_OEM_MINUS    = 0xBD;   // main-row -/_
 
     // ---------- Lumos params ----------
     private const int MinRadius   = 50;
@@ -84,6 +102,20 @@ internal sealed class LumosForm : Form
     [DllImport("gdi32.dll")]
     private static extern IntPtr SelectObject(IntPtr hdc, IntPtr h);
 
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SetWindowsHookEx(
+        int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern IntPtr GetModuleHandle(string lpModuleName);
+
     [StructLayout(LayoutKind.Sequential)]
     private struct POINT { public int X, Y; }
 
@@ -122,6 +154,18 @@ internal sealed class LumosForm : Form
         public uint             bmiColors;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct KBDLLHOOKSTRUCT
+    {
+        public uint   vkCode;
+        public uint   scanCode;
+        public uint   flags;
+        public uint   time;
+        public IntPtr dwExtraInfo;
+    }
+
+    private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+
     // ---------- State ----------
     private readonly int    _width;
     private readonly int    _height;
@@ -137,6 +181,10 @@ internal sealed class LumosForm : Form
     private readonly IntPtr _blendPtr;
     private readonly IntPtr _sizePtr;
     private readonly IntPtr _srcPointPtr;
+
+    // Low-level keyboard hook (kept alive while form is shown)
+    private LowLevelKeyboardProc _hookProc;
+    private IntPtr _hookId = IntPtr.Zero;
 
     public LumosForm()
     {
@@ -196,7 +244,6 @@ internal sealed class LumosForm : Form
         Marshal.StructureToPtr(new POINT { X = 0, Y = 0 }, _srcPointPtr, false);
 
         Shown      += OnShown;
-        KeyDown    += OnKeyDown;
         FormClosed += OnClosed;
     }
 
@@ -213,7 +260,23 @@ internal sealed class LumosForm : Form
     private void OnShown(object sender, EventArgs e)
     {
         BringToFront();
-        Activate();
+
+        // Install a low-level keyboard hook so ESC / + / - work even
+        // when another window has stolen focus. The form is
+        // WS_EX_TRANSPARENT (clicks pass through), so its own KeyDown
+        // is unreliable: a single click on another window yanks focus
+        // and WM_KEYDOWN stops arriving. A WH_KEYBOARD_LL hook sees
+        // every key in the system and does not depend on focus.
+        //
+        // The callback returns immediately. Any UI work (Close, Render)
+        // is deferred to the message loop via BeginInvoke so we never
+        // block the hook — Windows silently unhooks a callback that
+        // exceeds ~300ms.
+        _hookProc = HookCallback;
+        _hookId  = SetWindowsHookEx(WH_KEYBOARD_LL, _hookProc, GetModuleHandle(null), 0);
+        if (_hookId == IntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error(),
+                "SetWindowsHookEx(WH_KEYBOARD_LL) failed.");
 
         var timer = new Timer { Interval = 16 };
         timer.Tick += (_, _) =>
@@ -225,20 +288,53 @@ internal sealed class LumosForm : Form
         Render();
     }
 
-    private void OnKeyDown(object sender, KeyEventArgs e)
+    private IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
     {
-        switch (e.KeyCode)
+        if (nCode == HC_ACTION)
         {
-            case Keys.Escape:           Close(); break;
-            case Keys.Oemplus:
-            case Keys.Add:              _radius = Math.Min(_radius + RadiusStep, MaxRadius); Render(); break;
-            case Keys.OemMinus:
-            case Keys.Subtract:         _radius = Math.Max(_radius - RadiusStep, MinRadius); Render(); break;
+            var kb = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
+            int msg = wParam.ToInt32();
+            bool swallow = false;
+
+            if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN)
+            {
+                if (kb.vkCode == VK_ESCAPE)
+                {
+                    BeginInvoke((Action)Close);
+                    swallow = true;
+                }
+                else if (kb.vkCode == VK_ADD || kb.vkCode == VK_OEM_PLUS)
+                {
+                    BeginInvoke((Action)(() =>
+                    {
+                        _radius = Math.Min(_radius + RadiusStep, MaxRadius);
+                        Render();
+                    }));
+                    swallow = true;
+                }
+                else if (kb.vkCode == VK_SUBTRACT || kb.vkCode == VK_OEM_MINUS)
+                {
+                    BeginInvoke((Action)(() =>
+                    {
+                        _radius = Math.Max(_radius - RadiusStep, MinRadius);
+                        Render();
+                    }));
+                    swallow = true;
+                }
+            }
+
+            if (swallow) return (IntPtr)1;
         }
+        return CallNextHookEx(_hookId, nCode, wParam, lParam);
     }
 
     private void OnClosed(object sender, FormClosedEventArgs e)
     {
+        if (_hookId != IntPtr.Zero)
+        {
+            UnhookWindowsHookEx(_hookId);
+            _hookId = IntPtr.Zero;
+        }
         DeleteObject(_hDib);
         DeleteDC(_hdcSrc);
         Marshal.FreeHGlobal(_blendPtr);
