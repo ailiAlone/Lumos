@@ -34,3 +34,9 @@ artifacts/
 *.swp
 .DS_Store
 Thumbs.db
+
+## Local one-off artifacts (release helper files, scratch json, etc.)
+release_body.json
+release_response.json
+asset_response.json
+releases_list.json
