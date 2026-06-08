@@ -190,6 +190,13 @@ internal sealed class LumosForm : Form
     private readonly int    _height;
     private Point _mouse;
     private int   _radius = 280;
+    private readonly int    _coverRadius;   // radius large enough to cover the whole screen
+
+    // Animation
+    private enum AnimPhase { None, Showing, Hiding }
+    private AnimPhase _animPhase = AnimPhase.None;
+    private double    _animProgress;
+    private Timer     _animTimer;
 
     // DIB section handles
     private readonly IntPtr _hdcSrc;
@@ -219,6 +226,7 @@ internal sealed class LumosForm : Form
         Text              = "Lumos";
 
         _mouse = Cursor.Position;
+        _coverRadius = Math.Max(_width, _height) * 2;   // large enough to keep the whole screen transparent
 
         // Create a top-down 32-bit DIB section.
         var bmi = new BITMAPINFO
@@ -304,7 +312,14 @@ internal sealed class LumosForm : Form
             if (p != _mouse) { _mouse = p; Render(); }
         };
         timer.Start();
+
+        // Start show animation: the dark contracts from the edges toward the centre.
+        // At _coverRadius every pixel is inside the feather band (alpha < 255),
+        // so the screen is fully transparent. As _radius shrinks, distSq >= radiusSq
+        // starts appearing at the edges — the dark creeps inward.
+        _radius = _coverRadius;
         Render();
+        StartShowAnimation();
 
         // Pin to the very top of the topmost band. TopMost = true alone
         // marks us as topmost, but a freshly created topmost window
@@ -335,26 +350,39 @@ internal sealed class LumosForm : Form
             {
                 if (kb.vkCode == VK_ESCAPE)
                 {
-                    BeginInvoke((Action)Close);
+                    // If we're already hiding, ignore the duplicate key.
+                    if (_animPhase != AnimPhase.Hiding)
+                    {
+                        if (_animPhase == AnimPhase.Showing && _animTimer != null)
+                        {
+                            _animTimer.Stop();
+                            _animTimer.Dispose();
+                            _animTimer = null;
+                        }
+                        BeginInvoke((Action)StartHideAnimation);
+                    }
                     swallow = true;
                 }
-                else if (kb.vkCode == VK_ADD || kb.vkCode == VK_OEM_PLUS)
+                else if (_animPhase == AnimPhase.None)
                 {
-                    BeginInvoke((Action)(() =>
+                    if (kb.vkCode == VK_ADD || kb.vkCode == VK_OEM_PLUS)
                     {
-                        _radius = Math.Min(_radius + RadiusStep, MaxRadius);
-                        Render();
-                    }));
-                    swallow = true;
-                }
-                else if (kb.vkCode == VK_SUBTRACT || kb.vkCode == VK_OEM_MINUS)
-                {
-                    BeginInvoke((Action)(() =>
+                        BeginInvoke((Action)(() =>
+                        {
+                            _radius = Math.Min(_radius + RadiusStep, MaxRadius);
+                            Render();
+                        }));
+                        swallow = true;
+                    }
+                    else if (kb.vkCode == VK_SUBTRACT || kb.vkCode == VK_OEM_MINUS)
                     {
-                        _radius = Math.Max(_radius - RadiusStep, MinRadius);
-                        Render();
-                    }));
-                    swallow = true;
+                        BeginInvoke((Action)(() =>
+                        {
+                            _radius = Math.Max(_radius - RadiusStep, MinRadius);
+                            Render();
+                        }));
+                        swallow = true;
+                    }
                 }
             }
 
@@ -365,6 +393,12 @@ internal sealed class LumosForm : Form
 
     private void OnClosed(object sender, FormClosedEventArgs e)
     {
+        if (_animTimer != null)
+        {
+            _animTimer.Stop();
+            _animTimer.Dispose();
+            _animTimer = null;
+        }
         if (_hookId != IntPtr.Zero)
         {
             UnhookWindowsHookEx(_hookId);
@@ -375,6 +409,70 @@ internal sealed class LumosForm : Form
         Marshal.FreeHGlobal(_blendPtr);
         Marshal.FreeHGlobal(_sizePtr);
         Marshal.FreeHGlobal(_srcPointPtr);
+    }
+
+    // ---------- Show / hide animation ----------
+    private void StartShowAnimation()
+    {
+        _animPhase    = AnimPhase.Showing;
+        _animProgress = 0;
+        int target    = _radius == _coverRadius ? 280 : _radius; // remember the intended radius
+
+        _animTimer = new Timer { Interval = 16 }; // ~60 fps
+        _animTimer.Tick += (_, _) =>
+        {
+            _animProgress += 0.012; // ~1.4 s total (smooth and slow)
+            if (_animProgress >= 1.0)
+            {
+                _radius    = target;
+                _animPhase = AnimPhase.None;
+                _animTimer.Stop();
+                _animTimer.Dispose();
+                _animTimer = null;
+                Render();
+                return;
+            }
+
+            double t = EaseInOutCubic(_animProgress);
+            _radius = (int)(_coverRadius + (target - _coverRadius) * t);
+            Render();
+        };
+        _animTimer.Start();
+    }
+
+    private void StartHideAnimation()
+    {
+        _animPhase    = AnimPhase.Hiding;
+        _animProgress = 0;
+        int start     = _radius;
+
+        _animTimer = new Timer { Interval = 16 };
+        _animTimer.Tick += (_, _) =>
+        {
+            _animProgress += 0.025; // ~0.6 s total (hide can feel snappier)
+            if (_animProgress >= 1.0)
+            {
+                _radius    = _coverRadius;
+                _animPhase = AnimPhase.None;
+                _animTimer.Stop();
+                _animTimer.Dispose();
+                _animTimer = null;
+                Close();
+                return;
+            }
+
+            double t = EaseInOutCubic(_animProgress);
+            _radius = (int)(start + (_coverRadius - start) * t);
+            Render();
+        };
+        _animTimer.Start();
+    }
+
+    private static double EaseInOutCubic(double t)
+    {
+        return t < 0.5
+            ? 4 * t * t * t
+            : 1 - Math.Pow(-2 * t + 2, 3) / 2;
     }
 
     // ---------- Rendering ----------
